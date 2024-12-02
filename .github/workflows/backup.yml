@@ -1,0 +1,101 @@
+name: Backup Fork and Sync
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # 每週日午夜執行
+  workflow_dispatch:  # 允許手動觸發
+
+env:
+  UPSTREAM_REPO: ${{ vars.UPSTREAM_REPO || 'https://github.com/Guovin/iptv-api.git' }}
+  MAIN_BRANCH: ${{ vars.MAIN_BRANCH || 'master' }}
+
+jobs:
+  backup-and-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.PAT_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Tag current state
+        run: |
+          TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+          git tag -a "pre-sync-$TIMESTAMP" -m "Pre-sync state on $TIMESTAMP"
+          git push origin "pre-sync-$TIMESTAMP"
+
+      - name: Add upstream repository
+        run: |
+          git remote add upstream ${{ env.UPSTREAM_REPO }} || git remote set-url upstream ${{ env.UPSTREAM_REPO }}
+          git fetch --all --tags
+
+      - name: Sync and handle conflicts
+        run: |
+          branches=$(git branch -r | grep 'origin/' | grep -v 'origin/HEAD' | sed 's/origin\///')
+          
+          for branch in $branches; do
+            echo "Processing branch: $branch"
+            
+            if git ls-remote --exit-code --heads upstream $branch > /dev/null 2>&1; then
+              git checkout -B $branch origin/$branch
+              
+              echo "Changes in upstream $branch:"
+              git log --oneline $branch..upstream/$branch
+              
+              if git merge upstream/$branch --no-edit --allow-unrelated-histories; then
+                echo "Successfully merged changes for $branch"
+              else
+                echo "Merge conflict in $branch. Creating a new branch with upstream changes."
+                git merge --abort
+                conflict_branch="${branch}-upstream-changes"
+                git checkout -b $conflict_branch upstream/$branch
+                echo "Created new branch $conflict_branch with upstream changes"
+                git push origin $conflict_branch
+                echo "Please manually review and merge changes from $conflict_branch into $branch"
+                git checkout $branch
+              fi
+              git push origin $branch || echo "Failed to push $branch, please check and push manually if needed"
+            else
+              echo "Branch $branch does not exist in upstream. Skipping."
+            fi
+          done
+
+      - name: Create post-sync version tag
+        run: |
+          TIMESTAMP=$(date +"%Y%m%d%H%M%S")
+          git tag -a "post-sync-$TIMESTAMP" -m "Post-sync state on $TIMESTAMP"
+          git push origin "post-sync-$TIMESTAMP"
+
+      - name: Generate sync report
+        if: always()
+        run: |
+          echo "Sync Report" > sync_report.md
+          echo "===========" >> sync_report.md
+          echo "" >> sync_report.md
+          git branch -r | grep 'origin/' | grep -v 'origin/HEAD' | sed 's/origin\///' | while read branch; do
+            echo "## Branch: $branch" >> sync_report.md
+            if git log HEAD..origin/$branch --oneline | grep -q .; then
+              echo "Status: Changes synced" >> sync_report.md
+              echo "Changes:" >> sync_report.md
+              git log HEAD..origin/$branch --oneline >> sync_report.md
+            else
+              echo "Status: No changes or sync failed" >> sync_report.md
+            fi
+            echo "" >> sync_report.md
+          done
+
+      - name: Upload sync report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sync-report
+          path: sync_report.md
