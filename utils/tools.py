@@ -146,6 +146,9 @@ def get_total_urls(info_list, ipv_type_prefer, origin_type_prefer):
     """
     Get the total urls from info list
     """
+    origin_prefer_bool = bool(origin_type_prefer)
+    if not origin_prefer_bool:
+        origin_type_prefer = ["all"]
     categorized_urls = {
         origin: {"ipv4": [], "ipv6": []} for origin in origin_type_prefer
     }
@@ -163,7 +166,7 @@ def get_total_urls(info_list, ipv_type_prefer, origin_type_prefer):
         if origin == "subscribe" and "/rtp/" in url:
             origin = "multicast"
 
-        if origin not in origin_type_prefer:
+        if origin_prefer_bool and (origin not in origin_type_prefer):
             continue
 
         if config.open_filter_resolution and resolution:
@@ -183,6 +186,9 @@ def get_total_urls(info_list, ipv_type_prefer, origin_type_prefer):
 
         if resolution:
             url = add_url_info(url, resolution)
+
+        if not origin_prefer_bool:
+            origin = "all"
 
         if url_is_ipv6:
             categorized_urls[origin]["ipv6"].append(url)
@@ -205,7 +211,7 @@ def get_total_urls(info_list, ipv_type_prefer, origin_type_prefer):
                 if not urls:
                     break
                 limit = min(
-                    max(config.source_limits[origin] - ipv_num[ipv_type], 0),
+                    max(config.source_limits.get(origin, urls_limit) - ipv_num[ipv_type], 0),
                     max(config.ipv_limit[ipv_type] - ipv_num[ipv_type], 0),
                 )
                 limit_urls = urls[:limit]
@@ -222,9 +228,7 @@ def get_total_urls(info_list, ipv_type_prefer, origin_type_prefer):
             for ipv_type in ipv_type_total:
                 if len(total_urls) >= urls_limit:
                     break
-                extra_urls = categorized_urls[origin][ipv_type][
-                             : config.source_limits[origin]
-                             ]
+                extra_urls = categorized_urls[origin][ipv_type][: config.source_limits.get(origin, urls_limit)]
                 total_urls.extend(extra_urls)
                 total_urls = list(dict.fromkeys(total_urls))[:urls_limit]
 
@@ -291,27 +295,14 @@ def check_url_ipv_type(url):
     )
 
 
-def check_by_url_keywords_blacklist(url):
+def check_url_by_keywords(url, keywords=None):
     """
-    Check by URL blacklist keywords
+    Check by URL keywords
     """
-    return not any(keyword in url for keyword in config.url_keywords_blacklist)
-
-
-def check_url_by_patterns(url):
-    """
-    Check the url by patterns
-    """
-    return check_url_ipv_type(url) and check_by_url_keywords_blacklist(url)
-
-
-def filter_urls_by_patterns(urls):
-    """
-    Filter urls by patterns
-    """
-    urls = [url for url in urls if check_url_ipv_type(url)]
-    urls = [url for url in urls if check_by_url_keywords_blacklist(url)]
-    return urls
+    if not keywords:
+        return True
+    else:
+        return any(keyword in url for keyword in keywords)
 
 
 def merge_objects(*objects):
@@ -349,14 +340,15 @@ def get_ip_address():
     Get the IP address
     """
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    ip = "127.0.0.1"
     try:
         s.connect(("10.255.255.255", 1))
-        IP = s.getsockname()[0]
-    except Exception:
-        IP = "127.0.0.1"
+        ip = s.getsockname()[0]
+    except:
+        ip = "127.0.0.1"
     finally:
         s.close()
-    return f"http://{IP}:{os.environ.get("APP_PORT") or 8000}"
+        return f"http://{ip}:{config.app_port}"
 
 
 def convert_to_m3u():
@@ -562,6 +554,9 @@ def get_urls_from_file(path: str) -> list:
     if os.path.exists(real_path):
         with open(real_path, "r", encoding="utf-8") as f:
             for line in f:
+                line = line.strip()
+                if line.startswith("#"):
+                    continue
                 match = re.search(url_pattern, line)
                 if match:
                     urls.append(match.group().strip())
@@ -578,6 +573,9 @@ def get_name_urls_from_file(path: str) -> dict[str, list]:
     if os.path.exists(real_path):
         with open(real_path, "r", encoding="utf-8") as f:
             for line in f:
+                line = line.strip()
+                if line.startswith("#"):
+                    continue
                 name_url = get_name_url(line, pattern=txt_pattern)
                 if name_url and name_url[0]:
                     name = name_url[0]["name"]

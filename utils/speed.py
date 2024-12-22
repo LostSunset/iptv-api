@@ -2,13 +2,13 @@ import asyncio
 import re
 import subprocess
 from time import time
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import m3u8
 from aiohttp import ClientSession, TCPConnector
 
 from utils.config import config
-from utils.tools import is_ipv6, remove_cache_info, get_resolution_value
+from utils.tools import is_ipv6, remove_cache_info
 
 
 async def get_speed_with_download(url: str, timeout: int = config.sort_timeout) -> dict[str, float | None]:
@@ -35,8 +35,8 @@ async def get_speed_with_download(url: str, timeout: int = config.sort_timeout) 
     finally:
         end_time = time()
         total_time += end_time - start_time
-    info['speed'] = (total_size / total_time if total_time > 0 else 0) / 1024 / 1024
-    return info
+        info['speed'] = (total_size / total_time if total_time > 0 else 0) / 1024 / 1024
+        return info
 
 
 async def get_speed_m3u8(url: str, timeout: int = config.sort_timeout) -> dict[str, float | None]:
@@ -45,22 +45,40 @@ async def get_speed_m3u8(url: str, timeout: int = config.sort_timeout) -> dict[s
     """
     info = {'speed': None, 'delay': None}
     try:
-        url = quote(url, safe=':/?$&=@').partition('$')[0]
+        url = quote(url, safe=':/?$&=@[]').partition('$')[0]
         async with ClientSession(connector=TCPConnector(ssl=False), trust_env=True) as session:
-            async with session.head(url, timeout=2) as response:
-                if response.headers.get('Content-Length'):
-                    m3u8_obj = m3u8.load(url, timeout=2)
-                    speed_list = []
-                    start_time = time()
-                    for segment in m3u8_obj.segments:
-                        if time() - start_time > timeout:
-                            break
-                        ts_url = segment.absolute_uri
-                        download_info = await get_speed_with_download(ts_url, timeout)
-                        speed_list.append(download_info['speed'])
-                        if info['delay'] is None and download_info['delay'] is not None:
-                            info['delay'] = download_info['delay']
-                    info['speed'] = sum(speed_list) / len(speed_list) if speed_list else 0
+            async with session.head(url, timeout=5) as response:
+                content_type = response.headers.get('Content-Type')
+                if content_type:
+                    content_type = content_type.lower()
+                    location = response.headers.get('Location')
+                    if 'application/vnd.apple.mpegurl' in content_type:
+                        url = location or url
+                        m3u8_obj = m3u8.load(url, timeout=2)
+                        playlists = m3u8_obj.data.get('playlists')
+                        segments = m3u8_obj.segments
+                        if not segments and playlists:
+                            parsed_url = urlparse(url)
+                            url = f"{parsed_url.scheme}://{parsed_url.netloc}{parsed_url.path.rsplit('/', 1)[0]}/{playlists[0].get('uri', '')}"
+                            m3u8_obj = m3u8.load(url, timeout=2)
+                            segments = m3u8_obj.segments
+                        if not segments:
+                            return info
+                        ts_urls = [segment.absolute_uri for segment in segments]
+                        speed_list = []
+                        start_time = time()
+                        for ts_url in ts_urls:
+                            if time() - start_time > timeout:
+                                break
+                            download_info = await get_speed_with_download(ts_url, timeout)
+                            speed_list.append(download_info['speed'])
+                            if info['delay'] is None and download_info['delay'] is not None:
+                                info['delay'] = download_info['delay']
+                        info['speed'] = sum(speed_list) / len(speed_list) if speed_list else 0
+                    elif location:
+                        info.update(await get_speed_m3u8(location, timeout))
+                elif response.headers.get('Content-Length'):
+                    info.update(await get_speed_with_download(url, timeout))
                 else:
                     return info
     except:
@@ -193,10 +211,8 @@ async def get_speed(url, ipv6_proxy=None, callback=None):
         if ipv6_proxy and url_is_ipv6:
             data['speed'] = float("inf")
             data['delay'] = float("-inf")
-        elif '.m3u8' in url:
-            data.update(await get_speed_m3u8(url))
         else:
-            data.update(await get_speed_with_download(url))
+            data.update(await get_speed_m3u8(url))
         if cache_key and cache_key not in cache:
             cache[cache_key] = data
         return data
@@ -207,14 +223,12 @@ async def get_speed(url, ipv6_proxy=None, callback=None):
             callback()
 
 
-def sort_urls(name, data, logger=None, whitelist=None):
+def sort_urls(name, data, logger=None):
     """
     Sort the urls with info
     """
     filter_data = []
     for url, date, resolution, origin in data:
-        if whitelist and url in whitelist:
-            origin = "important"
         result = {
             "url": remove_cache_info(url),
             "date": date,
@@ -249,15 +263,11 @@ def sort_urls(name, data, logger=None, whitelist=None):
                     filter_data.append(result)
 
     def combined_key(item):
-        speed, delay, resolution, origin = item["speed"], item["delay"], item["resolution"], item["origin"]
+        speed, origin = item["speed"], item["origin"]
         if origin == "important":
             return float("inf")
         else:
-            return (
-                    config.speed_weight * (speed * 1024 if speed is not None else float("-inf"))
-                    - config.delay_weight * (delay if delay is not None else float("inf"))
-                    + config.resolution_weight * (get_resolution_value(resolution) if resolution else 0)
-            )
+            return speed if speed is not None else float("-inf")
 
     filter_data.sort(key=combined_key, reverse=True)
     return [
